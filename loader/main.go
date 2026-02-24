@@ -51,6 +51,7 @@ func main() {
 		log.Fatalf("loading eBPF collection: %v", err)
 	}
 
+	// Try loading with default options (without BTF)
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
 		log.Fatalf("creating collection: %v", err)
