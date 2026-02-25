@@ -1,0 +1,41 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# eBPF Objects
+detectors/*.o
+detectors/*.d
+
+# Go
+*.test
+*.out
+coverage.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies
+vendor/
+
+# Build artifacts
+loader/syscall*
+main
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp

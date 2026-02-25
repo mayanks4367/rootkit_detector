@@ -1,0 +1,32 @@
+# golangci-lint configuration
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - typecheck
+    - unused
+  disabled:
+    - gochecknoglobals
+    - gocyclo
+    - funlen
+    - gocognit
+    - lll
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+  govet:
+    enable-all: true
+  gofmt:
+    simplify: true
+  goimports:
+    local-prefixes: rootkit-detector
