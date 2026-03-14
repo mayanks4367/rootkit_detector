@@ -1,82 +1,95 @@
-.PHONY: all build test clean ebpf build-ebpf run help install-deps
+.PHONY: all help kernel daemon tui build clean install fmt lint test \
+        ebpf build-nosudo run
 
-# Build configuration
-BINARY_NAME=loader
-BIN_DIR=bin
-DETECTORS_DIR=detectors
-LOADER_DIR=loader
+# ── Configuration ──────────────────────────────────────────────────────────
+KVER     := $(shell uname -r)
+KDIR     ?= /lib/modules/$(KVER)/build
+RUST_BIN := $(HOME)/.cargo/bin
 
-# Colors
-GREEN=\033[0;32m
-YELLOW=\033[1;33m
-NC=\033[0m
+# Colours
+GREEN  := \033[0;32m
+YELLOW := \033[1;33m
+CYAN   := \033[0;36m
+NC     := \033[0m
 
+# ══════════════════════════════════════════════════════════════════════════════
 all: help
 
 help:
-	@echo "eBPF Rootkit Detector - Build Commands"
 	@echo ""
-	@echo "Usage: make [target]"
+	@echo "  rootkit-radar — Build System"
 	@echo ""
-	@echo "Targets:"
-	@echo "  build          Build the Go loader (requires sudo for eBPF)"
-	@echo "  build-nosudo   Build without requiring sudo"
-	@echo "  ebpf          Compile eBPF programs"
-	@echo "  test          Run Go tests"
-	@echo "  lint          Run golangci-lint"
-	@echo "  fmt           Format Go code"
-	@echo "  vet           Run go vet"
-	@echo "  clean         Remove build artifacts"
-	@echo "  run           Build and run the detector"
-	@echo "  install-deps  Install required dependencies"
+	@echo "  Targets:"
+	@echo "    make kernel        Build the LKM (requires kernel headers)"
+	@echo "    make daemon        Build the Rust aggregation daemon"
+	@echo "    make tui           Build the Rust Ratatui TUI"
+	@echo "    make build         Build everything (kernel + daemon + tui)"
+	@echo "    make install       Full install via deploy/install.sh (run as root)"
+	@echo "    make clean         Remove all build artefacts"
+	@echo ""
+	@echo "  Legacy eBPF targets (kept for compatibility):"
+	@echo "    make ebpf          Compile eBPF C program"
+	@echo "    make build-nosudo  Build Go eBPF loader only"
+	@echo "    make fmt           Format Go code"
+	@echo "    make lint          Run golangci-lint on Go code"
+	@echo "    make test          Run Go tests"
 	@echo ""
 
-build: build-ebpf
-	@echo "$(GREEN)Building Go loader...$(NC)"
-	cd $(LOADER_DIR) && go build -o ../$(BIN_DIR)/$(BINARY_NAME) main.go
+# ── Phase 1: Kernel Module ─────────────────────────────────────────────────
+kernel:
+	@echo "$(CYAN)Building kernel module...$(NC)"
+	$(MAKE) -C kernel_module KDIR=$(KDIR)
+	@echo "$(GREEN)Kernel module built: kernel_module/rootkit_radar.ko$(NC)"
 
-build-nosudo:
-	@echo "$(GREEN)Building Go loader (no eBPF compile)...$(NC)"
-	cd $(LOADER_DIR) && go build -o ../$(BIN_DIR)/$(BINARY_NAME) main.go
+# ── Phase 2: Rust Daemon ───────────────────────────────────────────────────
+daemon:
+	@echo "$(CYAN)Building Rust daemon...$(NC)"
+	cd daemon && cargo build --release
+	@echo "$(GREEN)Daemon built: daemon/target/release/rr-daemon$(NC)"
 
+# ── Phase 3: Rust TUI ─────────────────────────────────────────────────────
+tui:
+	@echo "$(CYAN)Building Rust TUI...$(NC)"
+	cd tui && cargo build --release
+	@echo "$(GREEN)TUI built: tui/target/release/rr-tui$(NC)"
+
+# ── Build everything ───────────────────────────────────────────────────────
+build: kernel daemon tui
+
+# ── Install ────────────────────────────────────────────────────────────────
+install:
+	@echo "$(YELLOW)Running install script (requires root)...$(NC)"
+	sudo bash deploy/install.sh
+
+# ── Clean ──────────────────────────────────────────────────────────────────
+clean:
+	@echo "$(GREEN)Cleaning all build artefacts...$(NC)"
+	-$(MAKE) -C kernel_module KDIR=$(KDIR) clean 2>/dev/null || true
+	-cd daemon && cargo clean 2>/dev/null || true
+	-cd tui    && cargo clean 2>/dev/null || true
+	-rm -rf bin/
+	-rm -f detectors/*.o detectors/*.d loader/syscall*
+	go clean 2>/dev/null || true
+
+# ── Legacy eBPF / Go targets ───────────────────────────────────────────────
 ebpf:
-	@echo "$(YELLOW)Compiling eBPF programs...$(NC)"
-	clang -O2 -target bpf -g -I/usr/include -c $(DETECTORS_DIR)/syscall.c -o $(DETECTORS_DIR)/syscall.o
+	@echo "$(YELLOW)Compiling eBPF program...$(NC)"
+	clang -O2 -target bpf -g -I/usr/include \
+	      -c detectors/syscall.c -o detectors/syscall.o
 	@echo "$(GREEN)eBPF compilation complete$(NC)"
 
-test:
-	@echo "$(GREEN)Running tests...$(NC)"
-	go test -v ./...
-
-lint:
-	@echo "$(GREEN)Running linter...$(NC)"
-	golangci-lint run ./...
+build-nosudo:
+	@echo "$(GREEN)Building Go eBPF loader...$(NC)"
+	cd loader && go build -o ../bin/loader main.go
 
 fmt:
-	@echo "$(GREEN)Formatting code...$(NC)"
 	go fmt ./...
 
+lint:
+	golangci-lint run ./...
+
 vet:
-	@echo "$(GREEN)Running go vet...$(NC)"
 	go vet ./...
 
-clean:
-	@echo "$(GREEN)Cleaning build artifacts...$(NC)"
-	rm -rf $(BIN_DIR)
-	rm -f $(DETECTORS_DIR)/*.o
-	rm -f $(DETECTORS_DIR)/*.d
-	rm -f $(LOADER_DIR)/syscall*
-	go clean
-
-run: build
-	@echo "$(GREEN)Running detector...$(NC)"
-	sudo ./$(BIN_DIR)/$(BINARY_NAME)
-
-install-deps:
-	@echo "$(GREEN)Installing dependencies...$(NC)"
-	go mod download
-	@echo "$(GREEN)Dependencies installed$(NC)"
-	@echo ""
-	@echo "You may need to install:"
-	@echo "  - clang (for eBPF compilation)"
-	@echo "  - golangci-lint (for linting)"
+test:
+	go test -v ./...

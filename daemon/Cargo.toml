@@ -1,0 +1,37 @@
+[package]
+name = "rootkit-radar-daemon"
+version = "1.0.0"
+edition = "2021"
+description = "Userspace aggregation daemon for rootkit-radar"
+license = "GPL-2.0"
+
+[[bin]]
+name = "rr-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Linux Netlink
+netlink-sys = "0.8"
+netlink-packet-core = "0.7"
+
+# Unix domain socket helpers (std is enough but tokio::net provides async)
+# anyhow for ergonomic error handling
+anyhow = "1"
+
+# Raw syscall bindings (socket, bind, recv)
+libc = "0.2"

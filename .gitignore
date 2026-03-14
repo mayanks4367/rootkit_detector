@@ -2,7 +2,6 @@
 bin/
 *.exe
 *.dll
-*.so
 *.dylib
 
 # eBPF Objects
@@ -13,6 +12,22 @@ detectors/*.d
 *.test
 *.out
 coverage.txt
+
+# Rust / Cargo
+daemon/target/
+tui/target/
+Cargo.lock
+
+# Kernel module build artefacts
+kernel_module/*.o
+kernel_module/*.ko
+kernel_module/*.mod
+kernel_module/*.mod.c
+kernel_module/*.symvers
+kernel_module/*.order
+kernel_module/.tmp_versions/
+kernel_module/modules.order
+kernel_module/Module.symvers
 
 # IDE
 .idea/
@@ -32,10 +47,13 @@ vendor/
 loader/syscall*
 main
 
-# Logs
+# Logs (keep .log files out of VCS)
 *.log
 
 # Temporary files
 tmp/
 temp/
 *.tmp
+
+# Python venv (unrelated tooling)
+venv/

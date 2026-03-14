@@ -1,0 +1,29 @@
+[package]
+name = "rootkit-radar-tui"
+version = "1.0.0"
+edition = "2021"
+description = "Ratatui terminal dashboard for rootkit-radar"
+license = "GPL-2.0"
+
+[[bin]]
+name = "rr-tui"
+path = "src/main.rs"
+
+[dependencies]
+# TUI framework
+ratatui = "0.26"
+crossterm = { version = "0.27", features = ["event-stream"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# Serialisation (to receive events from daemon UDS)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time display
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"

@@ -1,0 +1,39 @@
+[Unit]
+Description=rootkit-radar userspace aggregation daemon
+Documentation=https://github.com/your-org/rootkit-radar
+# Require the kernel module to be loaded before starting
+After=network.target
+ConditionPathExists=/sys/module/rootkit_radar
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe rootkit_radar
+ExecStart=/usr/local/bin/rr-daemon
+ExecStopPost=/bin/rm -f /run/rootkit_radar.sock
+
+# Security hardening
+# The daemon needs CAP_NET_ADMIN for Netlink and CAP_SYS_ADMIN to verify
+# kernel pointers; run as root but drop all other caps.
+User=root
+Group=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+# Resource limits
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rootkit-radar
+
+[Install]
+WantedBy=multi-user.target
