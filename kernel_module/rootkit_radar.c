@@ -23,16 +23,16 @@
 #include <linux/sched/signal.h>
 #include <linux/pid.h>
 #include <linux/fs.h>
+#include <linux/kprobes.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/timer.h>
+#include <linux/workqueue.h>
 #include <linux/jiffies.h>
 #include <linux/kallsyms.h>
 #include <linux/netlink.h>
 #include <linux/skbuff.h>
 #include <linux/rcupdate.h>
 #include <linux/list.h>
-#include <linux/kset.h>
 #include <linux/kobject.h>
 #include <linux/string.h>
 #include <linux/slab.h>
@@ -53,6 +53,7 @@ MODULE_VERSION("1.0.0");
 
 /* ─── Scan interval ──────────────────────────────────────────────────────── */
 #define SCAN_INTERVAL_SECS     10
+#define MAX_PIDS               65536
 
 /* ─── Event types (mirrored in the Rust daemon) ──────────────────────────── */
 #define EVT_SYSCALL_HOOK       1
@@ -64,23 +65,42 @@ struct rr_event {
     __u32 event_type;           /* EVT_* constants above                     */
     __u32 pid;                  /* relevant PID (0 if not applicable)         */
     __s64 timestamp_ns;         /* ktime_get_real_ns()                        */
-    char  description[256];     /* human-readable detail                      */
+    __u32 certainty;            /* 0=low, 1=high, 2=critical (verified)      */
+    char  description[252];     /* human-readable detail                      */
 };
 
 /* ─── Globals ────────────────────────────────────────────────────────────── */
 static struct sock          *nl_sock;
-static struct timer_list     scan_timer;
+static struct delayed_work   scan_work;
+
+/* Persistence tracking for hidden PIDs to avoid race-condition false positives */
+static unsigned long *prev_hidden_pids;
+/* Tracking CPU time to detect active hidden processes ("Ghost Catcher") */
+static u64 *prev_cpu_times;
+
+/* Typedef for kallsyms_lookup_name */
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+static kallsyms_lookup_name_t kallsyms_lookup_name_fn;
+
+static unsigned long _stext_addr;
+static unsigned long _etext_addr;
 
 /* Resolved at init via kallsyms */
 static unsigned long        *sys_call_table_ptr;
 
 /* Saved baseline addresses for the syscalls we watch */
-#define NR_WATCHED_SYSCALLS  4
+#define NR_WATCHED_SYSCALLS  10
 static const int watched_nrs[NR_WATCHED_SYSCALLS] = {
     __NR_read,
     __NR_write,
     __NR_execve,
     __NR_getdents64,
+    __NR_kill,
+    __NR_ptrace,
+    __NR_openat,
+    __NR_socket,
+    __NR_finit_module,
+    __NR_init_module,
 };
 static unsigned long baseline_addrs[NR_WATCHED_SYSCALLS];
 
@@ -89,10 +109,6 @@ static unsigned long baseline_addrs[NR_WATCHED_SYSCALLS];
 /**
  * nl_send_event() - Broadcast a detection event to all Netlink subscribers.
  * @evt: Pointer to the event to send.
- *
- * Uses nlmsg_new / nlmsg_put / genlmsg_multicast.  If the socket or skb
- * allocation fails we simply log and return; detection must never crash the
- * host.
  */
 static void nl_send_event(const struct rr_event *evt)
 {
@@ -126,13 +142,14 @@ static void nl_send_event(const struct rr_event *evt)
 /**
  * emit_event() - Fill an rr_event and broadcast it.
  */
-static void emit_event(u32 type, u32 pid, const char *fmt, ...)
+static void emit_event(u32 type, u32 pid, u32 certainty, const char *fmt, ...)
 {
     struct rr_event evt = {};
     va_list args;
 
     evt.event_type   = type;
     evt.pid          = pid;
+    evt.certainty    = certainty;
     evt.timestamp_ns = ktime_get_real_ns();
 
     va_start(args, fmt);
@@ -140,23 +157,12 @@ static void emit_event(u32 type, u32 pid, const char *fmt, ...)
     va_end(args);
 
     nl_send_event(&evt);
-    pr_info("rootkit_radar: [EVT %u] %s\n", type, evt.description);
+    pr_info("rootkit_radar: [EVT %u] [CERT %u] %s\n", type, certainty, evt.description);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Detection Vector 1: Syscall Hook Detection
+ * Detection Vector 1: Syscall Hook Detection (Improved)
  * ═══════════════════════════════════════════════════════════════════════════
- *
- * Strategy: At module load we snapshot the addresses stored in sys_call_table
- * for the syscalls we care about.  On each periodic scan we re-read those
- * slots and compare against:
- *   a) The saved baseline (pointer has changed → hook installed after us).
- *   b) The kernel text segment [_stext, _etext).  If the current pointer
- *      falls outside that range it is almost certainly a hooked trampoline
- *      in a module or injected page.
- *
- * We access sys_call_table read-only inside an RCU read-side critical section.
- * No write lock is needed because we are not restoring; only alerting.
  */
 
 static void scan_syscall_hooks(void)
@@ -171,119 +177,128 @@ static void scan_syscall_hooks(void)
     for (i = 0; i < NR_WATCHED_SYSCALLS; i++) {
         unsigned long current_addr;
         int           nr = watched_nrs[i];
+        u8            instr[5];
+        bool          bad_instr = false;
 
         current_addr = sys_call_table_ptr[nr];
 
         /* Check 1: has the pointer changed from our baseline? */
         if (current_addr != baseline_addrs[i]) {
-            emit_event(EVT_SYSCALL_HOOK, 0,
-                "sys_call_table[%d] pointer changed: was 0x%lx, now 0x%lx",
-                nr, baseline_addrs[i], current_addr);
-        }
+            /* 
+             * Check 2: does the pointer lie outside the kernel text segment?
+             * OR does it start with suspicious instructions (JMP/INT3)?
+             */
+            if (copy_from_kernel_nofault(instr, (void *)current_addr, 5) == 0) {
+                if (instr[0] == 0xE9 || instr[0] == 0xCC) { /* JMP or INT3 */
+                    bad_instr = true;
+                }
+            }
 
-        /* Check 2: does the pointer lie outside the kernel text segment? */
-        if (current_addr < (unsigned long)_stext ||
-            current_addr >= (unsigned long)_etext) {
-            emit_event(EVT_SYSCALL_HOOK, 0,
-                "sys_call_table[%d]=0x%lx is OUTSIDE kernel text "
-                "[0x%lx, 0x%lx) — likely hook trampoline",
-                nr, current_addr,
-                (unsigned long)_stext,
-                (unsigned long)_etext);
+            if (current_addr < _stext_addr || current_addr >= _etext_addr || bad_instr) {
+                emit_event(EVT_SYSCALL_HOOK, 0, 2, /* 2 = Critical */
+                    "sys_call_table[%d] HOOKED: addr=0x%lx, outside_text=%d, bad_instr=%d",
+                    nr, current_addr, 
+                    (current_addr < _stext_addr || current_addr >= _etext_addr),
+                    bad_instr);
+            } else {
+                /* Changed but still in text and no bad instr -> Low certainty */
+                emit_event(EVT_SYSCALL_HOOK, 0, 0,
+                    "sys_call_table[%d] changed: 0x%lx -> 0x%lx (still in text)",
+                    nr, baseline_addrs[i], current_addr);
+            }
         }
+        cond_resched();
     }
 
     rcu_read_unlock();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Detection Vector 2: Hidden Process Detection (DKOM)
+ * Detection Vector 2: Hidden Process Detection (The "Ghost Catcher")
  * ═══════════════════════════════════════════════════════════════════════════
- *
- * Strategy: Walk the kernel task_struct list with for_each_process() and
- * collect all PIDs visible at kernel level.  Then iterate /proc numerically
- * to collect PIDs visible in procfs.  Any PID present in the kernel list but
- * absent from /proc is DKOM-hidden.
- *
- * We use RCU for the task list traversal (held only during the walk) and
- * release it before the /proc lookup to avoid lock-order issues.
- *
- * Limitation: namespaced containers may legitimately show a process in the
- * global task list but not in the current /proc namespace.  A production
- * deployment should compare within the same PID namespace.  This
- * implementation targets the host (init_pid_ns) for simplicity.
  */
-
-#define MAX_PIDS  65536
 
 static void scan_hidden_processes(void)
 {
-    /* Bitmap of PIDs seen in the kernel task list */
     unsigned long *kernel_pids;
+    unsigned long *curr_hidden_pids;
     struct task_struct *task;
     struct pid    *p;
+    int pid;
 
-    kernel_pids = kzalloc(BITS_TO_LONGS(MAX_PIDS) * sizeof(unsigned long),
-                          GFP_KERNEL);
-    if (!kernel_pids) {
-        pr_warn("rootkit_radar: DKOM scan: failed to alloc pid bitmap\n");
+    kernel_pids = kzalloc(BITS_TO_LONGS(MAX_PIDS) * sizeof(unsigned long), GFP_KERNEL);
+    curr_hidden_pids = kzalloc(BITS_TO_LONGS(MAX_PIDS) * sizeof(unsigned long), GFP_KERNEL);
+    if (!kernel_pids || !curr_hidden_pids) {
+        kfree(kernel_pids);
+        kfree(curr_hidden_pids);
         return;
     }
 
     /* --- Phase 1: collect kernel-visible PIDs under RCU --- */
     rcu_read_lock();
     for_each_process(task) {
-        pid_t pid = task->pid;
-        if (pid > 0 && pid < MAX_PIDS)
-            set_bit(pid, kernel_pids);
+        if (task->pid > 0 && task->pid < MAX_PIDS)
+            set_bit(task->pid, kernel_pids);
     }
     rcu_read_unlock();
 
-    /* --- Phase 2: check each kernel PID against procfs --- */
-    for (int pid = 2; pid < MAX_PIDS; pid++) {
-        if (!test_bit(pid, kernel_pids))
-            continue;
-
-        /*
-         * find_get_pid() does a quick lookup in the pid hash table.
-         * If it returns NULL the PID has already exited — not suspicious.
-         * We then try to find the corresponding /proc/<pid> dentry.
-         */
+    /* --- Phase 2: check each active PID in the hash table --- */
+    for (pid = 2; pid < MAX_PIDS; pid++) {
         p = find_get_pid(pid);
         if (!p)
             continue;
 
-        {
-            /* Try to look up /proc/<pid>. Use d_lookup on proc root. */
-            struct dentry *proc_root = NULL;
-            struct dentry *pid_dentry = NULL;
-            char   pid_str[16];
-            struct qstr  q;
+        rcu_read_lock();
+        task = pid_task(p, PIDTYPE_PID);
+        if (task) {
+            /* Check if PID is in hash but missing from task list */
+            if (!test_bit(pid, kernel_pids) && !(task->flags & PF_KTHREAD)) {
+                u64 curr_cpu_time = task->utime + task->stime;
+                u32 certainty = 0;
 
-            proc_root = proc_self->d_sb ? proc_self->d_sb->s_root : NULL;
+                set_bit(pid, curr_hidden_pids);
 
-            snprintf(pid_str, sizeof(pid_str), "%d", pid);
-            q.name = pid_str;
-            q.len  = strlen(pid_str);
-            q.hash = full_name_hash(proc_root, pid_str, q.len);
-
-            if (proc_root) {
-                pid_dentry = d_lookup(proc_root, &q);
-                if (!pid_dentry) {
-                    /* PID is in task list but not findable in /proc → DKOM */
-                    emit_event(EVT_HIDDEN_PROCESS, (u32)pid,
-                        "PID %d present in kernel task_struct list but "
-                        "absent from /proc — possible DKOM rootkit", pid);
-                } else {
-                    dput(pid_dentry);
+                /* 
+                 * Persistence + Activity Check:
+                 * 1. Did it persist since the last scan?
+                 * 2. Has it consumed CPU time since the last scan? (Ghost detection)
+                 */
+                if (prev_hidden_pids && test_bit(pid, prev_hidden_pids)) {
+                    certainty = 1; /* High: Persists */
+                    if (prev_cpu_times && curr_cpu_time > prev_cpu_times[pid]) {
+                        certainty = 2; /* Critical: Persists AND Active */
+                    }
                 }
+
+                if (certainty > 0) {
+                    char comm[TASK_COMM_LEN];
+                    strscpy(comm, task->comm, sizeof(comm));
+                    emit_event(EVT_HIDDEN_PROCESS, (u32)pid, certainty,
+                        "PID %d (%s) hidden: persists=%d, ghost_active=%d",
+                        pid, comm, (certainty >= 1), (certainty == 2));
+                }
+
+                if (prev_cpu_times)
+                    prev_cpu_times[pid] = curr_cpu_time;
             }
         }
+        rcu_read_unlock();
 
         put_pid(p);
+        if (pid % 1024 == 0)
+            cond_resched();
+    }
+
+    /* Update persistence tracker */
+    if (prev_hidden_pids) {
+        memcpy(prev_hidden_pids, curr_hidden_pids, BITS_TO_LONGS(MAX_PIDS) * sizeof(unsigned long));
+    } else {
+        prev_hidden_pids = curr_hidden_pids;
+        curr_hidden_pids = NULL;
     }
 
     kfree(kernel_pids);
+    kfree(curr_hidden_pids);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -309,11 +324,15 @@ static void scan_hidden_modules(void)
 {
     struct kobject  *kobj;
     struct list_head *pos;
-    char   kset_names[256][MODULE_NAME_LEN];
+    char (*kset_names)[MODULE_NAME_LEN];
     int    kset_count = 0;
     int    i;
 
     if (!module_kset_ptr || !modules_list_ptr)
+        return;
+
+    kset_names = kmalloc_array(256, MODULE_NAME_LEN, GFP_KERNEL);
+    if (!kset_names)
         return;
 
     /* --- Phase 1: snapshot kset member names (brief spinlock) --- */
@@ -331,6 +350,10 @@ static void scan_hidden_modules(void)
         bool found = false;
         struct module *mod;
 
+        /* Ignore our own module and common noise */
+        if (strcmp(kset_names[i], "rootkit_radar") == 0)
+            continue;
+
         rcu_read_lock();
         list_for_each(pos, modules_list_ptr) {
             mod = list_entry(pos, struct module, list);
@@ -342,23 +365,25 @@ static void scan_hidden_modules(void)
         rcu_read_unlock();
 
         if (!found && strlen(kset_names[i]) > 0) {
-            emit_event(EVT_HIDDEN_MODULE, 0,
-                "Module '%s' present in kset but absent from modules list "
-                "— possible stealth module (self-unlinked)", kset_names[i]);
+            emit_event(EVT_HIDDEN_MODULE, 0, 2, /* 2 = Critical */
+                "Module '%s' hidden (unlinked from modules list)", kset_names[i]);
         }
+        cond_resched();
     }
+
+    kfree(kset_names);
 }
 
-/* ─── Periodic scan timer callback ──────────────────────────────────────── */
+/* ─── Periodic scan worker ──────────────────────────────────────── */
 
-static void run_all_scans(struct timer_list *t)
+static void run_all_scans(struct work_struct *work)
 {
     scan_syscall_hooks();
     scan_hidden_processes();
     scan_hidden_modules();
 
-    /* Re-arm the timer */
-    mod_timer(&scan_timer, jiffies + SCAN_INTERVAL_SECS * HZ);
+    /* Re-arm the worker */
+    schedule_delayed_work(&scan_work, SCAN_INTERVAL_SECS * HZ);
 }
 
 /* ─── Module init / exit ─────────────────────────────────────────────────── */
@@ -371,56 +396,70 @@ static struct netlink_kernel_cfg nl_cfg = {
 static int __init rootkit_radar_init(void)
 {
     int i;
+    struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
 
-    pr_info("rootkit_radar: initialising detection engine\n");
+    pr_info("rootkit_radar: initialising advanced detection engine\n");
 
-    /* ── 1. Resolve sys_call_table ── */
-    sys_call_table_ptr = (unsigned long *)
-        kallsyms_lookup_name("sys_call_table");
-    if (!sys_call_table_ptr) {
-        pr_err("rootkit_radar: cannot resolve sys_call_table via kallsyms\n");
+    /* ── 0. Resolve kallsyms_lookup_name ── */
+    if (register_kprobe(&kp) < 0) {
+        pr_err("rootkit_radar: failed to resolve kallsyms_lookup_name\n");
         return -ENOENT;
     }
+    kallsyms_lookup_name_fn = (kallsyms_lookup_name_t)kp.addr;
+    unregister_kprobe(&kp);
 
-    /* Snapshot baseline syscall addresses */
+    if (!kallsyms_lookup_name_fn) return -ENOENT;
+
+    _stext_addr = kallsyms_lookup_name_fn("_stext");
+    _etext_addr = kallsyms_lookup_name_fn("_etext");
+
+    /* ── 1. Resolve sys_call_table ── */
+    sys_call_table_ptr = (unsigned long *)kallsyms_lookup_name_fn("sys_call_table");
+    if (!sys_call_table_ptr) return -ENOENT;
+
     for (i = 0; i < NR_WATCHED_SYSCALLS; i++)
         baseline_addrs[i] = sys_call_table_ptr[watched_nrs[i]];
 
-    pr_info("rootkit_radar: syscall baseline captured (%d entries)\n",
-            NR_WATCHED_SYSCALLS);
-
     /* ── 2. Resolve module_kset and modules list ── */
-    module_kset_ptr  = (struct kset *)
-        kallsyms_lookup_name("module_kset");
-    modules_list_ptr = (struct list_head *)
-        kallsyms_lookup_name("modules");
+    {
+        struct kset **module_kset_ptr_ptr = (struct kset **)
+            kallsyms_lookup_name_fn("module_kset");
+        if (module_kset_ptr_ptr)
+            module_kset_ptr = *module_kset_ptr_ptr;
+    }
+    modules_list_ptr = (struct list_head *)kallsyms_lookup_name_fn("modules");
 
-    if (!module_kset_ptr || !modules_list_ptr)
-        pr_warn("rootkit_radar: module scan unavailable "
-                "(kallsyms resolution failed)\n");
+    /* ── 3. Initialize tracking structures ── */
+    prev_cpu_times = kvzalloc(MAX_PIDS * sizeof(u64), GFP_KERNEL);
+    if (!prev_cpu_times) return -ENOMEM;
 
-    /* ── 3. Create Netlink socket ── */
+    /* ── 4. Create Netlink socket ── */
     nl_sock = netlink_kernel_create(&init_net, NETLINK_ROOTKIT_RADAR, &nl_cfg);
     if (!nl_sock) {
-        pr_err("rootkit_radar: failed to create netlink socket\n");
+        kvfree(prev_cpu_times);
         return -ENOMEM;
     }
 
-    /* ── 4. Start periodic scan timer ── */
-    timer_setup(&scan_timer, run_all_scans, 0);
-    mod_timer(&scan_timer, jiffies + SCAN_INTERVAL_SECS * HZ);
+    /* ── 5. Start periodic scan worker ── */
+    INIT_DELAYED_WORK(&scan_work, run_all_scans);
+    schedule_delayed_work(&scan_work, SCAN_INTERVAL_SECS * HZ);
 
-    pr_info("rootkit_radar: armed — scanning every %d seconds\n",
-            SCAN_INTERVAL_SECS);
+    pr_info("rootkit_radar: armed and ready\n");
     return 0;
 }
 
 static void __exit rootkit_radar_exit(void)
 {
-    del_timer_sync(&scan_timer);
+    cancel_delayed_work_sync(&scan_work);
 
     if (nl_sock)
         netlink_kernel_release(nl_sock);
+
+    if (prev_hidden_pids)
+        kfree(prev_hidden_pids);
+    
+    if (prev_cpu_times)
+        kvfree(prev_cpu_times);
 
     pr_info("rootkit_radar: unloaded\n");
 }

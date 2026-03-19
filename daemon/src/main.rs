@@ -12,6 +12,7 @@
 //!
 //! The daemon must run as root (required for Netlink protocol 31).
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -21,9 +22,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Mutex as TokioMutex};
 use tracing::{error, info, warn};
 
 /* ─── Constants ──────────────────────────────────────────────────────────── */
@@ -34,12 +35,21 @@ const UDS_PATH: &str             = "/run/rootkit_radar.sock";
 const JSON_LOG_PATH: &str        = "/var/log/rootkit_radar.log";
 const EVENT_RING_SIZE: usize     = 1_000;
 const BROADCAST_CAPACITY: usize  = 256;
+const ESCALATION_THRESHOLD: u32  = 2; // Reduced because LKM now does its own persistence check
 
 /* Wire-format event — must match the C struct rr_event exactly.
- * Layout: u32 + u32 + i64 + [u8; 256]  = 272 bytes, no padding. */
-const EVENT_WIRE_SIZE: usize = 4 + 4 + 8 + 256; // 272
+ * Layout: u32 + u32 + i64 + u32 + [u8; 252] = 272 bytes. */
+const EVENT_WIRE_SIZE: usize = 4 + 4 + 8 + 4 + 252; // 272
 
 /* ─── Event model ────────────────────────────────────────────────────────── */
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum Severity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RrEvent {
@@ -47,8 +57,9 @@ pub struct RrEvent {
     pub pid:         u32,
     pub timestamp:   DateTime<Utc>,
     pub description: String,
-    /// Human-readable type name derived from event_type
     pub type_name:   String,
+    pub severity:    Severity,
+    pub certainty:   u32,
 }
 
 fn type_name(t: u32) -> &'static str {
@@ -60,7 +71,60 @@ fn type_name(t: u32) -> &'static str {
     }
 }
 
-/// Parse a 272-byte raw Netlink payload into an RrEvent.
+/// Dynamic scoring engine to reduce false positives
+fn calculate_severity(evt: &RrEvent) -> Severity {
+    // Whitelist for common noisy Arch desktop processes
+    let benign_patterns = ["systemd", "dbus", "Xorg", "chrome", "firefox", "electron", "code", "kworker"];
+    for pattern in benign_patterns {
+        if evt.description.contains(pattern) {
+            return Severity::Low;
+        }
+    }
+
+    match evt.event_type {
+        1 => { // Syscall hook
+            if evt.certainty >= 2 { Severity::Critical }
+            else { Severity::High }
+        }
+        2 => { // Hidden process
+            if evt.certainty >= 2 { Severity::Critical }
+            else if evt.certainty == 1 { Severity::High }
+            else { Severity::Low }
+        }
+        3 => Severity::Critical, // Hidden module
+        _ => Severity::Low,
+    }
+}
+
+/// Executes a network lockdown using iptables.
+fn lockdown_network() -> Result<()> {
+    // Safety: check if isolation is enabled (could add a config file later)
+    info!("CRITICAL THREAT VERIFIED: Engaging Network Isolation Kill-Switch...");
+
+    let commands = [
+        "iptables -P INPUT DROP",
+        "iptables -P FORWARD DROP",
+        "iptables -P OUTPUT DROP",
+        "iptables -A INPUT -i lo -j ACCEPT",
+        "iptables -A OUTPUT -o lo -j ACCEPT",
+        "iptables -A INPUT -p tcp --dport 22 -j ACCEPT",
+        "iptables -A OUTPUT -p tcp --sport 22 -j ACCEPT",
+        "iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+        "iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED -j ACCEPT",
+    ];
+
+    for cmd in commands {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        std::process::Command::new(parts[0])
+            .args(&parts[1..])
+            .status()
+            .context(format!("Failed to execute: {cmd}"))?;
+    }
+
+    info!("Network isolation complete. Host is now in LOCKDOWN mode.");
+    Ok(())
+}
+
 fn parse_wire(buf: &[u8]) -> Option<RrEvent> {
     if buf.len() < EVENT_WIRE_SIZE {
         return None;
@@ -69,25 +133,29 @@ fn parse_wire(buf: &[u8]) -> Option<RrEvent> {
     let event_type  = u32::from_ne_bytes(buf[0..4].try_into().ok()?);
     let pid         = u32::from_ne_bytes(buf[4..8].try_into().ok()?);
     let ts_ns: i64  = i64::from_ne_bytes(buf[8..16].try_into().ok()?);
+    let certainty   = u32::from_ne_bytes(buf[16..20].try_into().ok()?);
 
-    // Description is a null-terminated C string in buf[16..272]
-    let desc_bytes  = &buf[16..16 + 256];
-    let null_pos    = desc_bytes.iter().position(|&b| b == 0).unwrap_or(256);
+    let desc_bytes  = &buf[20..20 + 252];
+    let null_pos    = desc_bytes.iter().position(|&b| b == 0).unwrap_or(252);
     let description = String::from_utf8_lossy(&desc_bytes[..null_pos]).into_owned();
 
-    // Convert nanoseconds since epoch to DateTime<Utc>
     let secs  = ts_ns / 1_000_000_000;
     let nanos = (ts_ns % 1_000_000_000) as u32;
     let timestamp = DateTime::from_timestamp(secs, nanos)
         .unwrap_or_else(Utc::now);
 
-    Some(RrEvent {
+    let mut evt = RrEvent {
         type_name: type_name(event_type).to_owned(),
+        severity: Severity::Low, // placeholder
         event_type,
         pid,
         timestamp,
         description,
-    })
+        certainty,
+    };
+    
+    evt.severity = calculate_severity(&evt);
+    Some(evt)
 }
 
 /* ─── Shared state ───────────────────────────────────────────────────────── */
@@ -166,6 +234,9 @@ async fn netlink_receive_loop(
     // Move blocking recv into a dedicated thread
     let ring2 = ring.clone();
     let log2  = log.clone();
+    
+    // Track anomaly counts to filter transient noise
+    let anomaly_counts: Arc<TokioMutex<HashMap<String, u32>>> = Arc::new(TokioMutex::new(HashMap::new()));
 
     tokio::task::spawn_blocking(move || {
         use std::os::unix::io::AsRawFd;
@@ -195,7 +266,25 @@ async fn netlink_receive_loop(
             }
             let payload = &raw[16..];
 
-            if let Some(evt) = parse_wire(payload) {
+            if let Some(mut evt) = parse_wire(payload) {
+                // Triage logic: Escalate severity if the same anomaly persists
+                let counts_clone = anomaly_counts.clone();
+                
+                evt = tokio::runtime::Handle::current().block_on(async move {
+                    let mut counts = counts_clone.lock().await;
+                    let key = format!("{}:{}", evt.type_name, evt.description);
+                    let count = counts.entry(key).or_insert(0);
+                    *count += 1;
+
+                    if *count >= ESCALATION_THRESHOLD {
+                        evt.severity = Severity::Critical;
+                        if let Err(e) = lockdown_network() {
+                            eprintln!("rootkit-radar: FAILED to engage network isolation: {e:#}");
+                        }
+                    }
+                    evt
+                });
+
                 // JSON structured log
                 {
                     let line = serde_json::to_string(&evt)

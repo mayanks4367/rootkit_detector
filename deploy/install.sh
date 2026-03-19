@@ -93,7 +93,7 @@ cp "${REPO_ROOT}/kernel_module/Makefile"        "${DKMS_SRC}/kernel_module/"
 cp "${REPO_ROOT}/deploy/dkms.conf"              "${DKMS_SRC}/"
 
 # Remove previous DKMS registration if present
-if dkms status "${MODULE_NAME}/${VERSION}" 2>/dev/null | grep -q installed; then
+if dkms status "${MODULE_NAME}/${VERSION}" 2>/dev/null | grep -q ""; then
     info "Removing previous DKMS registration..."
     dkms remove "${MODULE_NAME}/${VERSION}" --all || true
 fi

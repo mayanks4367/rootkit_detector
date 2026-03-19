@@ -42,13 +42,23 @@ use tokio::sync::Mutex;
 
 /* ─── Data model (mirrors daemon's RrEvent) ──────────────────────────────── */
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+enum Severity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RrEvent {
-    event_type:  u32,
-    pid:         u32,
-    timestamp:   DateTime<Utc>,
-    description: String,
-    type_name:   String,
+    pub event_type:  u32,
+    pub pid:         u32,
+    pub timestamp:   DateTime<Utc>,
+    pub description: String,
+    pub type_name:   String,
+    pub severity:    Severity,
+    pub certainty:   u32,
 }
 
 /* ─── Application state ─────────────────────────────────────────────────── */
@@ -174,14 +184,14 @@ async fn connect_to_daemon(
 /* ─── Demo mode synthetic events ─────────────────────────────────────────── */
 
 fn make_demo_event(seq: u32) -> RrEvent {
-    let (event_type, type_name, desc) = match seq % 3 {
-        0 => (1u32, "SYSCALL_HOOK",
+    let (event_type, type_name, severity, desc) = match seq % 3 {
+        0 => (1u32, "SYSCALL_HOOK", Severity::Critical,
               format!("sys_call_table[{}] pointer changed: 0xffffffff81234567 → 0xffffffffc0ab1234",
                       [0, 1, 59, 217][seq as usize % 4])),
-        1 => (2, "HIDDEN_PROCESS",
+        1 => (2, "HIDDEN_PROCESS", Severity::High,
               format!("PID {} in kernel task_struct but absent from /proc — DKOM suspected",
                       1000 + seq * 13)),
-        _ => (3, "HIDDEN_MODULE",
+        _ => (3, "HIDDEN_MODULE", Severity::Critical,
               format!("Module 'evil_mod_{}' present in kset but absent from modules list",
                       seq)),
     };
@@ -191,6 +201,8 @@ fn make_demo_event(seq: u32) -> RrEvent {
         timestamp: Utc::now(),
         description: desc,
         type_name: type_name.to_owned(),
+        severity,
+        certainty: if severity == Severity::Critical { 2 } else { 1 },
     }
 }
 
@@ -235,10 +247,18 @@ fn render_top_pane(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let alert_color = if state.alert_count > 0 { Color::Red } else { Color::Green };
+    let is_isolated = state.events.iter().any(|e| e.severity == Severity::Critical);
+    
     let alert_label = if state.alert_count > 0 {
         format!("  *** {} ALERTS DETECTED ***  ", state.alert_count)
     } else {
         "  SYSTEM CLEAN  ".to_owned()
+    };
+
+    let isolation_status = if is_isolated {
+        Span::styled("   Network: [HOST ISOLATED]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("   Network: [ACTIVE]", Style::default().fg(Color::Green))
     };
 
     let content = vec![
@@ -250,6 +270,7 @@ fn render_top_pane(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled("   Daemon: ", Style::default().fg(Color::Cyan)),
             Span::styled(status_text, Style::default().fg(status_color)
                 .add_modifier(Modifier::BOLD)),
+            isolation_status,
         ]),
         Line::from(""),
         Line::from(vec![
@@ -292,11 +313,20 @@ fn render_left_pane(frame: &mut Frame, state: &mut AppState, area: Rect) {
     } else {
         events.iter().map(|evt| {
             let ts = evt.timestamp.format("%H:%M:%S").to_string();
+            let sev_color = match evt.severity {
+                Severity::Critical => Color::Red,
+                Severity::High => Color::LightRed,
+                _ => Color::Yellow,
+            };
             let line = Line::from(vec![
                 Span::styled(format!(" {ts} "), Style::default().fg(Color::DarkGray)),
                 Span::styled(
+                    format!("[{:?}] ", evt.severity),
+                    Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
                     format!("[{}] ", evt.type_name),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Red),
                 ),
                 Span::styled(
                     evt.description.chars().take(60).collect::<String>(),
@@ -336,6 +366,11 @@ fn render_right_pane(frame: &mut Frame, state: &mut AppState, area: Rect) {
         events.iter().map(|evt| {
             let ts    = evt.timestamp.format("%H:%M:%S").to_string();
             let color = if evt.event_type == 2 { Color::Magenta } else { Color::LightRed };
+            let sev_color = match evt.severity {
+                Severity::Critical => Color::Red,
+                Severity::High => Color::Yellow,
+                _ => Color::Gray,
+            };
             let pid_str = if evt.pid > 0 {
                 format!("PID:{} ", evt.pid)
             } else {
@@ -344,6 +379,10 @@ fn render_right_pane(frame: &mut Frame, state: &mut AppState, area: Rect) {
 
             let line = Line::from(vec![
                 Span::styled(format!(" {ts} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("[{:?}] ", evt.severity),
+                    Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(
                     format!("[{}] {}", evt.type_name, pid_str),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
