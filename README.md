@@ -20,8 +20,8 @@ This detector monitors for suspicious kernel-level activities that normal progra
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          │                       │                       │
     ┌────▼────┐             ┌─────▼─────┐             ┌───▼───┐
-    │Kprobes │             │   Events  │             │ CLI   │
-    │Trace   │             │  Processing│             │ Web UI│
+    │Kprobes  │             │   Events  │             │ CLI   │
+    │Trace    │             │ Processing│             │ Web UI│
     └─────────┘             └───────────┘             └───────┘
 ```
 
